@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildGraph, distances, edgeBrightness, layout, nodeBrightness, placeLabels, search, sectors } from "./graph.js";
+import { buildGraph, distances, edgeBrightness, layout, nodeBrightness, placeLabels, search, sectors, timeline } from "./graph.js";
 
 // What /api/entities answers: each link is in the lists of both its ends.
 const link = (s, r, o, fact) => ({ text: `${s} — ${r} — ${o}`, fact_id: fact });
@@ -125,4 +125,44 @@ test("labels keep off the panels", () => {
   const cand = [{ node: 0, x: 50, y: 50, r: 3, w: 40, h: 18 }, { node: 1, x: 300, y: 50, r: 3, w: 40, h: 18 }];
   const out = placeLabels(cand, { width: 400, height: 300, most: 5, blocked: [{ x: 0, y: 0, w: 150, h: 300 }] });
   assert.deepEqual(out.map((p) => p.node), [1]);
+});
+
+// Facts 10, 11, 12 confirmed one day apart; Alone has no link.
+const facts = [
+  { id: 10, created_at: "2026-01-01T09:00:00Z", decided_at: "2026-01-01T10:00:00Z" },
+  { id: 11, created_at: "2026-01-02T10:00:00Z", decided_at: null },
+  { id: 12, created_at: "2026-01-03T10:00:00Z", decided_at: "2026-01-03T10:00:00Z" },
+];
+
+test("timeline: links by their fact, things by their first link, the rest by id", () => {
+  const g = buildGraph(things);
+  const steps = timeline(g, facts);
+  assert.deepEqual(steps, [Date.parse("2026-01-01T10:00:00Z"), Date.parse("2026-01-02T10:00:00Z"), Date.parse("2026-01-03T10:00:00Z")]);
+  const byName = Object.fromEntries(g.nodes.map((n) => [n.name, n.step]));
+  assert.deepEqual(byName, { SINCH: 0, av88: 0, Kote: 1, Tbilisi: 2, Alone: 2 });
+  assert.deepEqual(g.edges.map((e) => [e.relations[0], e.step]), [["supplier in", 0], ["works on", 1], ["lives in", 2]]);
+});
+
+test("timeline without times gives nothing and leaves no steps", () => {
+  const g = buildGraph(things);
+  assert.deepEqual(timeline(g, []), []);
+  assert.equal(g.nodes[0].step, undefined);
+  assert.equal(distances(g, 0, 3).size, 4);
+});
+
+test("highlight walks only the links there at a step", () => {
+  const g = buildGraph(things);
+  timeline(g, facts);
+  const sinch = g.nodes.findIndex((n) => n.name === "SINCH");
+  assert.deepEqual([...distances(g, sinch, 5, 0).keys()].map((i) => g.nodes[i].name), ["SINCH", "av88"]);
+  assert.equal(distances(g, sinch, 5, 1).size, 3);
+  assert.equal(edgeBrightness(g, distances(g, sinch, 5), 5, 1).size, 2);
+});
+
+test("a label keeps the place it had before when it is free", () => {
+  const c = { node: 0, x: 100, y: 100, r: 4, w: 40, h: 18 };
+  assert.equal(placeLabels([c], { width: 400, height: 400, most: 5 })[0].slot, 0);
+  const again = placeLabels([{ ...c, prefer: 2 }], { width: 400, height: 400, most: 5 })[0];
+  assert.equal(again.slot, 2);
+  assert.equal(again.y, 100 - 8 - 18);
 });

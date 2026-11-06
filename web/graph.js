@@ -23,13 +23,13 @@ export function buildGraph(things) {
   things.forEach((t, i) => {
     for (const lk of t.links || []) {
       const key = `${lk.fact_id}|${lk.text}`;
-      if (!ends.has(key)) ends.set(key, { text: String(lk.text), at: new Set() });
+      if (!ends.has(key)) ends.set(key, { text: String(lk.text), fact: lk.fact_id, at: new Set() });
       ends.get(key).at.add(i);
     }
   });
   const edges = [];
   const seen = new Map();
-  for (const { text, at } of ends.values()) {
+  for (const { text, fact, at } of ends.values()) {
     const [a, b] = [...at];
     if (b === undefined || at.size !== 2) continue;
     const parts = text.split(SEP);
@@ -40,10 +40,11 @@ export function buildGraph(things) {
     const pair = from < to ? `${from}-${to}` : `${to}-${from}`;
     if (seen.has(pair)) {
       edges[seen.get(pair)].relations.push(relation);
+      edges[seen.get(pair)].facts.push(fact);
       continue;
     }
     seen.set(pair, edges.length);
-    edges.push({ index: edges.length, a: from, b: to, relations: [relation] });
+    edges.push({ index: edges.length, a: from, b: to, relations: [relation], facts: [fact] });
   }
   for (const e of edges) {
     nodes[e.a].links.push({ edge: e.index, other: e.b });
@@ -254,15 +255,60 @@ export function layout(graph, list, { spacing = 14, iterations = 260 } = {}) {
   return pos;
 }
 
+// When things and links came into memory, from the confirmed facts
+// (/api/facts: id, created_at, decided_at). A link: when its first fact was
+// confirmed. A thing: when its first link came; a thing with none takes the time
+// of the thing before it by id (ids grow with time). Gives the sorted distinct
+// times, `steps`; each thing and link gets `time` and `step`, its index there.
+// Without any time, steps is empty and nothing gets one.
+export function timeline(graph, facts) {
+  const when = new Map();
+  for (const f of facts || []) {
+    const t = Date.parse(f.decided_at || f.created_at);
+    if (Number.isFinite(t)) when.set(f.id, t);
+  }
+  for (const e of graph.edges) {
+    e.time = Infinity;
+    for (const id of e.facts || []) if (when.has(id)) e.time = Math.min(e.time, when.get(id));
+  }
+  for (const n of graph.nodes) {
+    n.time = Infinity;
+    for (const { edge } of n.links) n.time = Math.min(n.time, graph.edges[edge].time);
+  }
+  const byId = [...graph.nodes].sort((x, y) => Number(x.id) - Number(y.id) || x.index - y.index);
+  const first = byId.find((n) => Number.isFinite(n.time));
+  const clear = () => {
+    for (const x of [...graph.nodes, ...graph.edges]) delete x.time;
+    return [];
+  };
+  if (!first) return clear();
+  let prev = first.time;
+  for (const n of byId) {
+    if (Number.isFinite(n.time)) prev = n.time;
+    else n.time = prev;
+  }
+  for (const e of graph.edges) {
+    if (!Number.isFinite(e.time)) e.time = Math.max(graph.nodes[e.a].time, graph.nodes[e.b].time);
+  }
+  const steps = [...new Set([...graph.nodes, ...graph.edges].map((x) => x.time))].sort((a, b) => a - b);
+  const index = new Map(steps.map((t, i) => [t, i]));
+  for (const x of [...graph.nodes, ...graph.edges]) x.step = index.get(x.time);
+  return steps;
+}
+
+// Whether a link is there at step `at` (no step: always).
+const there = (e, at) => !(e.step > at);
+
 // Steps from a thing along links, up to `levels`: Map(node index → steps).
-export function distances(graph, start, levels) {
+// Only links there at step `at` count.
+export function distances(graph, start, levels, at = Infinity) {
   const out = new Map([[start, 0]]);
   let front = [start];
   for (let d = 1; d <= levels && front.length; d++) {
     const next = [];
     for (const n of front) {
-      for (const { other } of graph.nodes[n].links) {
-        if (out.has(other)) continue;
+      for (const { edge, other } of graph.nodes[n].links) {
+        if (out.has(other) || !there(graph.edges[edge], at)) continue;
         out.set(other, d);
         next.push(other);
       }
@@ -274,9 +320,10 @@ export function distances(graph, start, levels) {
 
 // The brightness of the highlight from a thing: its own links 1, the links of
 // those things 1/2, the next 1/4 and so on. Edge index → brightness.
-export function edgeBrightness(graph, dist, levels) {
+export function edgeBrightness(graph, dist, levels, at = Infinity) {
   const out = new Map();
   for (const e of graph.edges) {
+    if (!there(e, at)) continue;
     const da = dist.get(e.a);
     const db = dist.get(e.b);
     if (da === undefined || db === undefined) continue;
@@ -316,7 +363,9 @@ export function search(graph, text, most = 8) {
 
 // Where labels go on screen. Candidates come most important first; a label
 // takes the first of four places by its point that hits no label already
-// placed and no important point, or is left out. Gives {node, x, y} for each.
+// placed and no important point, or is left out. A candidate's `prefer` (0–3),
+// the place it had before, is tried first, so labels do not jump around.
+// Gives {node, x, y, slot} for each.
 export function placeLabels(candidates, { width, height, most, pad = 3, points = [], blocked = [] }) {
   // blocked: rectangles {x, y, w, h} where nothing is placed (panels over the view).
   const placed = blocked.map((b) => ({ ...b, node: -1 }));
@@ -347,11 +396,14 @@ export function placeLabels(candidates, { width, height, most, pad = 3, points =
       [c.x - c.w / 2, c.y - gap - c.h],
       [c.x - c.w / 2, c.y + gap],
     ];
-    for (const [x, y] of tries) {
+    const order = [0, 1, 2, 3];
+    if (c.prefer >= 0 && c.prefer < 4) order.unshift(...order.splice(c.prefer, 1));
+    for (const slot of order) {
+      const [x, y] = tries[slot];
       const r = { x, y, w: c.w, h: c.h, node: c.node };
       if (hits(r)) continue;
       placed.push(r);
-      out.push({ node: c.node, x, y });
+      out.push({ node: c.node, x, y, slot });
       break;
     }
   }
