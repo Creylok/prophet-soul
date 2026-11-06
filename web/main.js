@@ -16,6 +16,7 @@ import {
   placeLabels,
   search,
   sectors,
+  timeline,
 } from "./graph.js";
 
 const SPACING = 14;
@@ -25,7 +26,7 @@ const DEFAULTS = { labels: 60, fade_levels: 4, speed: 1, spin: false };
 const HELP =
   "Drag — rotate · right drag or Shift — pan · wheel — zoom · " +
   "WASD or arrows — fly · Q/E — down/up · 1–9 — sectors · 0 — overview · " +
-  "F — fly to selected · Esc — clear";
+  "F — fly to selected · Space — play the timeline · Esc — clear";
 
 export function activate(prophet) {
   try {
@@ -66,6 +67,21 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
+// Play and pause drawn, not typed: "▶" turns into an emoji on some systems.
+function icon(kind) {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", "0 0 12 12");
+  svg.setAttribute("width", "10");
+  svg.setAttribute("height", "10");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", kind === "pause" ? "M2.5 1.5h2.5v9H2.5zM7 1.5h2.5v9H7z" : "M3 1.2v9.6L10.5 6z");
+  path.setAttribute("fill", "currentColor");
+  svg.append(path);
+  return svg;
+}
+
 function createView(prophet, body) {
   let opts = { ...DEFAULTS, ...prophet.settings() };
   let graph = { nodes: [], edges: [] };
@@ -76,6 +92,12 @@ function createView(prophet, body) {
   let found = [];
   let currentSector = -1;
   let running = false;
+  // The timeline: steps are the times things and links came; `at` is where the
+  // slider is (a step index, fractional while playing).
+  let steps = [];
+  let at = 0;
+  let playing = false;
+  let shownEdges = -1;
 
   // ---- the page --------------------------------------------------------------
   body.style.maxWidth = "none";
@@ -117,7 +139,35 @@ function createView(prophet, body) {
   });
   const help = el("div", { class: "hint", style: { position: "absolute", left: "10px", right: "10px", bottom: "8px", fontSize: "11px", pointerEvents: "none", textAlign: "center" } }, HELP);
   const empty = el("div", { class: "hint", style: { position: "absolute", inset: "0", display: "none", alignItems: "center", justifyContent: "center", textAlign: "center", padding: "24px" } });
-  root.append(canvas, labels, sectorBox, info, help, empty);
+  const playBtn = el("button", { type: "button", class: "btn btn-ghost btn-sm", "aria-label": "Play", title: "Play (Space)" });
+  Object.assign(playBtn.style, { width: "1.6rem", height: "1.6rem", padding: "0", flex: "none", display: "inline-flex", alignItems: "center", justifyContent: "center" });
+  playBtn.append(icon("play"));
+  const slider = el("input", { type: "range", min: "0", max: "0", step: "any", value: "0", "aria-label": "Time", class: "soul-time" });
+  Object.assign(slider.style, { flex: "1", minWidth: "0", cursor: "pointer" });
+  // A thin track and a small thumb, the same in every browser.
+  const sliderStyle = el(
+    "style",
+    {},
+    `.soul-time{-webkit-appearance:none;appearance:none;background:transparent;height:12px;margin:0}
+.soul-time::-webkit-slider-runnable-track{height:3px;border-radius:2px;background:var(--soul-track)}
+.soul-time::-moz-range-track{height:3px;border-radius:2px;background:var(--soul-track)}
+.soul-time::-webkit-slider-thumb{-webkit-appearance:none;width:10px;height:10px;margin-top:-3.5px;border:none;border-radius:50%;background:var(--soul-thumb)}
+.soul-time::-moz-range-thumb{width:10px;height:10px;border:none;border-radius:50%;background:var(--soul-thumb)}`,
+  );
+  // The date sits above the slider, in the middle of it (past the play button).
+  const when = el("div", { class: "hint", style: { fontSize: "11px", whiteSpace: "nowrap", textAlign: "center", paddingLeft: "calc(1.6rem + 8px)" } });
+  // Quiet until the mouse comes: no panel, a grey slider, half seen.
+  const timebar = el(
+    "div",
+    {
+      style: { position: "absolute", left: "50%", transform: "translateX(-50%)", bottom: "32px", width: "max(60%, min(320px, calc(100% - 40px)))", display: "none", flexDirection: "column", gap: "2px", padding: "2px 6px", opacity: "0.45", transition: "opacity 0.2s" },
+    },
+    when,
+    el("div", { style: { display: "flex", alignItems: "center", gap: "8px" } }, playBtn, slider),
+  );
+  timebar.onmouseenter = () => (timebar.style.opacity = "0.9");
+  timebar.onmouseleave = () => (timebar.style.opacity = playing ? "0.7" : "0.45");
+  root.append(sliderStyle, canvas, labels, sectorBox, info, timebar, help, empty);
   body.append(
     el("p", { class: "hint", style: { marginTop: "-8px", marginBottom: "10px" } }, "Memory visualisation: the things confirmed facts are about, and the links between them."),
     toolbar,
@@ -144,12 +194,22 @@ function createView(prophet, body) {
   scene.fog = new THREE.Fog(0x000000, 100, 1000);
 
   const sphere = new THREE.SphereGeometry(1, 16, 12);
-  const nodeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  // Each thing has its own opacity (instanceAlpha), so it can come from nothing.
+  const nodeMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true });
+  nodeMaterial.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace("#include <common>", "#include <common>\nattribute float instanceAlpha;\nvarying float vAlpha;")
+      .replace("#include <begin_vertex>", "#include <begin_vertex>\nvAlpha = instanceAlpha;");
+    shader.fragmentShader = shader.fragmentShader
+      .replace("#include <common>", "#include <common>\nvarying float vAlpha;")
+      .replace("#include <opaque_fragment>", "#include <opaque_fragment>\ngl_FragColor.a *= vAlpha;");
+  };
   let nodeMesh = null;
   const baseLines = new THREE.LineSegments(
     new THREE.BufferGeometry(),
     new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 1 }),
   );
+  baseLines.frustumCulled = false; // its ends move as links come and go
   scene.add(baseLines);
   const glowMaterial = new LineMaterial({ vertexColors: true, linewidth: 1.6, worldUnits: false, transparent: true, opacity: 0.9 });
   let glowLines = null;
@@ -170,6 +230,8 @@ function createView(prophet, body) {
     renderer.setClearColor(colours.bg, 1);
     scene.fog.color.copy(colours.bg);
     root.style.background = `#${colours.bg.getHexString()}`;
+    slider.style.setProperty("--soul-track", `#${colours.bg.clone().lerp(colours.fg, 0.3).getHexString()}`);
+    slider.style.setProperty("--soul-thumb", `#${colours.bg.clone().lerp(colours.fg, 0.7).getHexString()}`);
     const b = colours.bg;
     colours.labelBg = `rgba(${Math.round(b.r * 255)},${Math.round(b.g * 255)},${Math.round(b.b * 255)},0.62)`;
   }
@@ -188,9 +250,11 @@ function createView(prophet, body) {
     status.textContent = "Reading memory…";
     empty.style.display = "none";
     let things;
+    let facts = null;
     try {
       const q = projectSel.value ? `?project_id=${encodeURIComponent(projectSel.value)}` : "";
-      things = await prophet.api(`/api/entities${q}`);
+      // The facts only give the timeline its times; without them there is none.
+      [things, facts] = await Promise.all([prophet.api(`/api/entities${q}`), prophet.api("/api/facts?status=confirmed").catch(() => null)]);
     } catch (err) {
       status.textContent = `Could not read memory: ${err?.message || err}`;
       return;
@@ -199,6 +263,12 @@ function createView(prophet, body) {
     await new Promise((r) => setTimeout(r, 20));
     graph = buildGraph(Array.isArray(things) ? things : []);
     list = sectors(graph);
+    steps = timeline(graph, Array.isArray(facts?.facts) ? facts.facts : []);
+    setPlaying(false);
+    at = Math.max(0, steps.length - 1);
+    shownEdges = -1;
+    slider.max = String(at);
+    timebar.style.display = steps.length > 1 ? "flex" : "none";
     const big = Math.max(0, ...list.map((s) => (s.lonely ? 0 : s.members.length)));
     pos = layout(graph, list, { spacing: SPACING, iterations: big > 1500 ? 90 : big > 600 ? 160 : 260 });
     selected = -1;
@@ -229,24 +299,19 @@ function createView(prophet, body) {
     }
     const count = graph.nodes.length;
     nodeMesh = new THREE.InstancedMesh(sphere, nodeMaterial, Math.max(count, 1));
+    sphere.setAttribute("instanceAlpha", new THREE.InstancedBufferAttribute(new Float32Array(Math.max(count, 1)).fill(1), 1));
     nodeMesh.count = count;
-    const m = new THREE.Matrix4();
-    for (const n of graph.nodes) {
-      const r = radius(n);
-      m.makeScale(r, r, r).setPosition(pos[n.index * 3], pos[n.index * 3 + 1], pos[n.index * 3 + 2]);
-      nodeMesh.setMatrixAt(n.index, m);
-      nodeMesh.setColorAt(n.index, colours.fg);
-    }
-    nodeMesh.instanceMatrix.needsUpdate = true;
+    for (const n of graph.nodes) nodeMesh.setColorAt(n.index, colours.fg);
     scene.add(nodeMesh);
+    resetAppear();
+    placeNodes();
     const p = new Float32Array(graph.edges.length * 6);
-    graph.edges.forEach((e, k) => {
-      p.set([pos[e.a * 3], pos[e.a * 3 + 1], pos[e.a * 3 + 2], pos[e.b * 3], pos[e.b * 3 + 1], pos[e.b * 3 + 2]], k * 6);
-    });
     baseLines.geometry.dispose();
     baseLines.geometry = new THREE.BufferGeometry();
     baseLines.geometry.setAttribute("position", new THREE.BufferAttribute(p, 3));
-    baseLines.geometry.setAttribute("color", new THREE.BufferAttribute(new Float32Array(p.length), 3));
+    baseLines.geometry.setAttribute("color", new THREE.BufferAttribute(new Float32Array(graph.edges.length * 8), 4));
+    placeEdges();
+    drawWhen();
     let far = SPACING * 10;
     for (const s of list) far = Math.max(far, Math.hypot(...s.centre) + s.radius);
     scene.fog.near = far * 0.6;
@@ -255,6 +320,184 @@ function createView(prophet, body) {
     camera.updateProjectionMatrix();
     resetGlow();
     paint();
+  }
+
+  // ---- the timeline ----------------------------------------------------------------
+  const last_ = () => Math.max(0, steps.length - 1);
+  const timeOn = () => steps.length > 1 && at < last_();
+  const step = () => Math.floor(at + 1e-9);
+  const isShown = (i) => !timeOn() || !(graph.nodes[i].step > step());
+  // Highlights walk only the links there now.
+  const atStep = () => (timeOn() ? step() : Infinity);
+
+  const edgeThere = (e) => !(e.step > atStep());
+
+  // Coming and going is soft, however fast the timeline runs. A thing that comes
+  // grows out of nothing while it fades in (FADE_IN seconds); a link fades in the
+  // same way; one that goes fades out. Once a thing or a link has faded in, it
+  // flashes: lights up bright at once and dies out within FLASH seconds; a link
+  // that has faded in lights up the things at both its ends too. Each has `alpha` (how far it
+  // is there, 0 … 1) and `flash` (seconds into its flash; FLASH when done).
+  // Seconds on screen, not memory's own time.
+  const FADE_IN = 1.5;
+  const FLASH = 1;
+  const FLASH_RISE = 0.08;
+  const FADE_OUT = 0.4;
+  const ease = (k) => k * k * (3 - 2 * k);
+  const grow = (k) => 1 - (1 - k) ** 3;
+  const pulse = (f) => (f >= FLASH ? 0 : f < FLASH_RISE ? f / FLASH_RISE : (1 - (f - FLASH_RISE) / (FLASH - FLASH_RISE)) ** 2);
+  let nodeA = new Float64Array(0);
+  let nodeF = new Float64Array(0);
+  let edgeA = new Float64Array(0);
+  let edgeF = new Float64Array(0);
+  let settling = false;
+
+  function resetAppear() {
+    nodeA = new Float64Array(graph.nodes.length);
+    edgeA = new Float64Array(graph.edges.length);
+    nodeF = new Float64Array(graph.nodes.length).fill(FLASH);
+    edgeF = new Float64Array(graph.edges.length).fill(FLASH);
+    graph.nodes.forEach((n, i) => (nodeA[i] = isShown(i) ? 1 : 0));
+    graph.edges.forEach((e, k) => (edgeA[k] = edgeThere(e) ? 1 : 0));
+    shownEdges = edgeA.reduce((a, b) => a + b, 0);
+    settling = false;
+  }
+
+  function stepAppear(dt) {
+    if (!settling) return;
+    let moving = false;
+    let shapes = false;
+    // Returns true when it has just finished fading in.
+    const step_ = (A, F, i, on) => {
+      const a = A[i];
+      if (on) {
+        if (a >= 1 && F[i] >= FLASH) return false;
+        moving = true;
+        if (a < 1) {
+          if (a === 0) shapes = true;
+          A[i] = Math.min(1, a + dt / FADE_IN);
+          if (A[i] < 1) return false;
+          F[i] = 0; // faded in: now it flashes
+          return true;
+        }
+        F[i] = Math.min(FLASH, F[i] + dt);
+        return false;
+      } else {
+        if (a === 0) return false;
+        A[i] = Math.max(0, a - dt / FADE_OUT);
+        F[i] = FLASH;
+        if (A[i] === 0) shapes = true;
+        moving = true;
+        return false;
+      }
+    };
+    for (let i = 0; i < nodeA.length; i++) step_(nodeA, nodeF, i, isShown(i));
+    graph.edges.forEach((e, k) => {
+      if (!step_(edgeA, edgeF, k, edgeThere(e))) return;
+      for (const end of [e.a, e.b]) if (nodeA[end] >= 1) nodeF[end] = 0;
+    });
+    if (moving || shapes) {
+      placeNodes();
+      if (shapes) placeEdges();
+      recolour();
+    }
+    settling = moving;
+  }
+
+  // A thing grows from nothing as it fades in; while it flashes it swells a little.
+  const matrix = new THREE.Matrix4();
+  function placeNodes() {
+    if (!nodeMesh) return;
+    const alpha = nodeMesh.geometry.getAttribute("instanceAlpha");
+    for (const n of graph.nodes) {
+      const a = nodeA[n.index] ?? 1;
+      const f = pulse(nodeF[n.index] ?? FLASH);
+      const r = radius(n) * grow(a) * (1 + 0.35 * f);
+      matrix.makeScale(r, r, r).setPosition(pos[n.index * 3], pos[n.index * 3 + 1], pos[n.index * 3 + 2]);
+      nodeMesh.setMatrixAt(n.index, matrix);
+      alpha?.setX(n.index, ease(a));
+    }
+    nodeMesh.instanceMatrix.needsUpdate = true;
+    if (alpha) alpha.needsUpdate = true;
+  }
+
+  // A link fully gone: both ends at one point, so it draws nothing.
+  function placeEdges() {
+    const attr = baseLines.geometry.getAttribute("position");
+    if (!attr) return;
+    const p = attr.array;
+    graph.edges.forEach((e, k) => {
+      const b = (edgeA[k] ?? 1) === 0 ? e.a : e.b;
+      p.set([pos[e.a * 3], pos[e.a * 3 + 1], pos[e.a * 3 + 2], pos[b * 3], pos[b * 3 + 1], pos[b * 3 + 2]], k * 6);
+    });
+    attr.needsUpdate = true;
+  }
+
+  // A little flash on top of the colour a thing or link has anyway.
+  const flashColour = new THREE.Color();
+  function flashed(c, f, strength) {
+    const p = pulse(f);
+    if (p > 0) c.lerp(flashColour, p * strength);
+    return c;
+  }
+
+  function drawWhen() {
+    if (steps.length < 2) return;
+    const span = steps[steps.length - 1] - steps[0];
+    const fmt = { day: "numeric", month: "short", year: "numeric" };
+    if (span < 3 * 86400000) Object.assign(fmt, { hour: "2-digit", minute: "2-digit" });
+    const s = step();
+    let things = 0;
+    for (const n of graph.nodes) if (!(n.step > s)) things++;
+    when.textContent = `${new Date(steps[s]).toLocaleString(undefined, fmt)} · ${things} of ${graph.nodes.length}`;
+    if (!slider.matches(":active")) slider.value = String(at);
+  }
+
+  function setAt(v) {
+    at = Math.max(0, Math.min(last_(), v));
+    let count = 0;
+    for (const e of graph.edges) if (edgeThere(e)) count++;
+    if (count !== shownEdges) {
+      shownEdges = count;
+      // The links there changed: the highlight walks again, without blinking.
+      if (lit.focus >= 0) {
+        light(lit.focus);
+        recolour();
+      }
+    }
+    settling = true;
+    drawWhen();
+    labelsDirty = true;
+    start();
+  }
+
+  function setPlaying(on) {
+    playing = on && steps.length > 1;
+    playBtn.replaceChildren(icon(playing ? "pause" : "play"));
+    playBtn.setAttribute("aria-label", playing ? "Pause" : "Play");
+    playBtn.title = playing ? "Pause (Space)" : "Play (Space)";
+    if (!timebar.matches(":hover")) timebar.style.opacity = playing ? "0.7" : "0.45";
+  }
+
+  function togglePlay() {
+    if (playing) {
+      setPlaying(false);
+      return;
+    }
+    setPlaying(true);
+    if (at >= last_()) setAt(0);
+    start();
+  }
+
+  function stepPlay(dt) {
+    if (!playing) return;
+    // The whole memory in 8 to 40 seconds, whatever its size.
+    const seconds = Math.max(8, Math.min(40, steps.length * 0.08));
+    const next = at + (dt * last_()) / seconds;
+    if (next >= last_()) {
+      setPlaying(false);
+      setAt(last_());
+    } else setAt(next);
   }
 
   // ---- the highlight -------------------------------------------------------------
@@ -272,15 +515,20 @@ function createView(prophet, body) {
     if (!nodeMesh) return;
     const focus = hovered >= 0 ? hovered : selected;
     if (focus >= 0 && focus !== lit.focus) {
-      const levels = opts.fade_levels;
-      const dist = distances(graph, focus, levels);
-      lit = { dist, edges: edgeBrightness(graph, dist, levels), focus };
+      light(focus);
       glow = Math.min(glow, 0.35); // a new thing: fade in again from soft
-      buildGlow();
     }
     glowTarget = focus >= 0 ? 1 : 0;
     recolour();
     start();
+  }
+
+  // What the highlight from a thing reaches, over the links there now.
+  function light(focus) {
+    const levels = opts.fade_levels;
+    const dist = distances(graph, focus, levels, atStep());
+    lit = { dist, edges: edgeBrightness(graph, dist, levels, atStep()), focus };
+    buildGlow();
   }
 
   function resetGlow() {
@@ -309,12 +557,14 @@ function createView(prophet, body) {
     scene.add(glowLines);
   }
 
+  const WHITE = new THREE.Color(1, 1, 1);
   const calmNode = new THREE.Color();
   const calmEdge = new THREE.Color();
   function recolour() {
     if (!nodeMesh) return;
     const k = glow * glow * (3 - 2 * glow); // smoothstep
     calmNode.copy(mix(colours.bg, colours.fg, colours.dark ? 0.62 : 0.55));
+    flashColour.copy(colours.hl).lerp(colours.dark ? WHITE : colours.hl, 0.6);
     for (const n of graph.nodes) {
       const steps = lit.dist.get(n.index);
       const base = list[n.sector]?.lonely ? mix(colours.bg, calmNode, 0.7).clone() : calmNode.clone();
@@ -322,14 +572,20 @@ function createView(prophet, body) {
       if (steps !== undefined) c = base.lerp(colours.hl, Math.max(0.3, nodeBrightness(steps)) * 0.8 * k);
       else if (found.includes(n.index)) c = base.lerp(colours.hl, 0.5);
       else c = base.lerp(colours.bg, 0.3 * k);
-      nodeMesh.setColorAt(n.index, c);
+      nodeMesh.setColorAt(n.index, flashed(c, nodeF[n.index] ?? FLASH, 1));
     }
     if (nodeMesh.instanceColor) nodeMesh.instanceColor.needsUpdate = true;
 
     const colour = baseLines.geometry.getAttribute("color");
     calmEdge.copy(mix(colours.bg, colours.fg, 0.2 - 0.07 * k));
     if (colour) {
-      for (let i = 0; i < graph.edges.length * 2; i++) colour.setXYZ(i, calmEdge.r, calmEdge.g, calmEdge.b);
+      for (let k = 0; k < graph.edges.length; k++) {
+        const f = edgeF[k] ?? FLASH;
+        const c = f >= FLASH ? calmEdge : flashed(tmp.copy(calmEdge), f, 0.6);
+        const a = ease(edgeA[k] ?? 1);
+        colour.setXYZW(k * 2, c.r, c.g, c.b, a);
+        colour.setXYZW(k * 2 + 1, c.r, c.g, c.b, a);
+      }
       colour.needsUpdate = true;
     }
     if (glowLines) {
@@ -530,6 +786,10 @@ function createView(prophet, body) {
       flyToSector(Number(ev.code.slice(5)) - 1);
     } else if (ev.code === "Digit0") {
       flyOverview();
+    } else if (ev.code === "Space") {
+      if (ev.target?.tagName === "BUTTON" || ev.target === slider) return;
+      ev.preventDefault();
+      togglePlay();
     } else if (ev.code === "KeyF") {
       if (selected >= 0) flyToNode(selected);
     } else if (k === "escape") {
@@ -605,7 +865,7 @@ function createView(prophet, body) {
       v.set(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]).applyMatrix4(inv);
       const d = -v.z;
       sd[i] = d;
-      if (d <= camera.near) {
+      if (d <= camera.near || !isShown(i)) {
         sr[i] = -1;
         continue;
       }
@@ -635,7 +895,10 @@ function createView(prophet, body) {
       if (isLit) score += 100 - steps * 10;
       if (i === selected) score += 200;
       if (i === hovered) score += 300;
-      cand.push({ node: i, x: sx[i], y: sy[i], r: Math.max(sr[i], 2), w: widthOf(n), h: 18, score, isLit, nearness });
+      // A label already shown keeps its place before a new one takes it.
+      const had = pool.get(i);
+      if (had) score += 2.5;
+      cand.push({ node: i, x: sx[i], y: sy[i], r: Math.max(sr[i], 2), w: widthOf(n), h: 18, score, isLit, nearness, prefer: had?._slot ?? -1 });
       if (isLit || i === selected) pts.push({ node: i, x: sx[i], y: sy[i], r: Math.max(sr[i], 3) });
     }
     if (underMouse) {
@@ -649,7 +912,7 @@ function createView(prophet, body) {
     for (const c of cand.slice(0, opts.labels)) if (!c.isLit) pts.push({ node: c.node, x: c.x, y: c.y, r: Math.max(c.r, 2) });
     const most = Math.max(opts.labels, Math.min(lit.dist.size, 60));
     const box = root.getBoundingClientRect();
-    const blocked = [sectorBox, info, help, toolbar]
+    const blocked = [sectorBox, info, timebar, help, toolbar]
       .filter((b) => b.style.display !== "none" && root.contains(b))
       .map((b) => {
         const r = b.getBoundingClientRect();
@@ -692,15 +955,21 @@ function createView(prophet, body) {
         pool.set(p.node, d);
       }
       d._x = p.x;
+      d._slot = p.slot;
       d._y = p.y;
       d.style.transform = `translate(${Math.round(p.x)}px, ${Math.round(p.y)}px)`;
       const strong = p.node === hovered || p.node === selected;
-      d.style.color = c.isLit ? soft : found.includes(p.node) ? hl : fg;
+      // A name comes like its thing: fades in, then flashes and settles.
+      const fl = pulse(nodeF[p.node] ?? FLASH);
+      const colour = c.isLit ? soft : found.includes(p.node) ? hl : fg;
+      d.style.color = fl > 0 ? `#${new THREE.Color(colour).lerp(flashColour, fl * 0.5).getHexString()}` : colour;
+      d.style.textShadow = fl > 0 ? `0 0 ${(6 * fl).toFixed(1)}px #${flashColour.getHexString()}` : "";
       d.style.fontWeight = strong ? "600" : "400";
       d.style.background = strong ? colours.labelBg : "transparent";
       const calm = 0.35 + c.nearness * 0.6;
       const lit_ = c.isLit ? Math.max(0.5, nodeBrightness(lit.dist.get(p.node))) : 0;
-      d.style.opacity = String(c.isLit ? calm + (lit_ - calm) * gk : found.includes(p.node) ? 1 : calm * (1 - 0.35 * gk));
+      const there = ease(nodeA[p.node] ?? 1);
+      d.style.opacity = String(Math.min(1, there * (c.isLit ? calm + (lit_ - calm) * gk : found.includes(p.node) ? 1 : calm * (1 - 0.35 * gk)) + fl * 0.25));
     }
   }
 
@@ -778,6 +1047,8 @@ function createView(prophet, body) {
     stepFly(now);
     stepGlow(now);
     stepKeys(dt);
+    stepPlay(dt);
+    stepAppear(dt);
     controls.autoRotate = opts.spin && !fly && !keys.size && hovered < 0;
     controls.update();
     renderer.render(scene, camera);
@@ -809,6 +1080,17 @@ function createView(prophet, body) {
       search_.value = "";
       drawResults();
       search_.blur();
+    }
+  });
+  playBtn.onclick = togglePlay;
+  slider.addEventListener("input", () => {
+    if (playing) setPlaying(false);
+    setAt(Number(slider.value));
+  });
+  slider.addEventListener("keydown", (ev) => {
+    if (ev.code === "Space") {
+      ev.preventDefault();
+      togglePlay();
     }
   });
   projectSel.addEventListener("change", load);
