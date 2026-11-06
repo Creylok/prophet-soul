@@ -1,0 +1,41 @@
+{
+  "id": "soul",
+  "name": "Soul",
+  "version": "0.2.0",
+  "api_version": 1,
+  "description": "Memory visualisation: Prophet's memory things and links as a 3D graph with search, sectors and free flight.",
+  "script": "/omniscient.js",
+  "settings": {
+    "type": "object",
+    "properties": {
+      "labels": {
+        "type": "integer",
+        "title": "Labels on screen",
+        "description": "How many labels to show at once, nearest and most linked first.",
+        "minimum": 5,
+        "maximum": 300,
+        "default": 60
+      },
+      "fade_levels": {
+        "type": "integer",
+        "title": "Highlight levels",
+        "description": "How many steps from a thing the highlight reaches on hover; each step is half as bright.",
+        "minimum": 1,
+        "maximum": 8,
+        "default": 4
+      },
+      "speed": {
+        "type": "number",
+        "title": "Flight speed",
+        "minimum": 0.2,
+        "maximum": 5,
+        "default": 1
+      },
+      "spin": {
+        "type": "boolean",
+        "title": "Spin slowly while idle",
+        "default": false
+      }
+    }
+  }
+}
